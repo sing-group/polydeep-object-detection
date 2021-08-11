@@ -1,0 +1,9 @@
+/datasets*
+image-files
+cad
+experiments
+downloads-cache
+
+# IDEs and editors
+/.idea
+

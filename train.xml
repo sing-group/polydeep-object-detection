@@ -1,0 +1,187 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<pipeline xmlns="http://www.sing-group.org/compi/pipeline-1.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <version>0.1.1</version>
+    <params>
+        <param name="dataset_dir" shortName="dd" defaultValue="/datasets">
+            Path where the dataset is stored.
+        </param>
+        <param name="dataset_name" shortName="dn">
+            Name of the dataset that will be processed.
+        </param>
+        <param name="ttv_dir" shortName="td" defaultValue="/experiment/ttv">
+            Path where the splitted dataset will be stored.
+        </param>
+        <param name="results_dir" shortName="rd" defaultValue="/experiment/results">
+            Path where the results will be stored.
+        </param>
+        <param name="summaries_dir" shortName="sd" defaultValue="/experiment/summaries">
+            Path where the summaries will be stored.
+        </param>
+        <param name="params_dir" shortName="pd" defaultValue="/experiment/params">
+            Path where the params to initialize the network are stored.
+        </param>
+        <param name="params_name" shortName="pn" defaultValue="">
+            Name of file with the network parameters (CNN weights) to start with.
+        </param>
+        <param name="seed" shortName="s" defaultValue="33">
+            Seed number for random number generation. Keep the same for reproducibility.
+        </param>
+        <param name="model_name" shortName="mn" defaultValue="yolo3_darknet53_voc">
+            Name of the CNN model. It must be a valid GluonCV model.
+        </param>
+        <param name="epochs" shortName="e" defaultValue="20">
+            Number of epochs to train the CNN.
+        </param>
+        <param name="num_gpus" shortName="gpu" defaultValue="0">
+            Number of GPUs to use. 0 for CPU.
+        </param>
+        <param name="gpu_id" shortName="gi" defaultValue="0">
+            GPU identifier for sanity check.
+        </param>
+    </params>
+    <tasks>
+        <task id="check-dataset" params="dataset_dir dataset_name">
+            <![CDATA[
+                if [ ! -d "${dataset_dir}/${dataset_name}" ]; then
+                    echo "Missing dataset ${dataset_name}. Please, use the download-dataset.sh script to download it.";
+                    exit 1;
+                fi;
+            ]]>
+        </task>
+        <task id="check-gpu" after="check-dataset" params="gpu_id">
+            scripts/sanity_check.sh $gpu_id
+        </task>
+        <task id="model-development" after="check-gpu"
+              params="epochs model_name params_dir params_name num_gpus results_dir ttv_dir seed dataset_dir dataset_name"
+              src="scripts/train.py" interpreter="python3.5  -u -c &quot;${task_code}&quot; ">
+        </task>
+        <task id="generate-plot-data" after="model-development" params="results_dir summaries_dir">
+            <![CDATA[
+
+                train_loss_file="$summaries_dir/train_loss.dat";
+
+                echo "epoch,obj_loss,center_loss,scale_loss,class_loss" > $train_loss_file
+
+                while read line;
+                do
+                    epoch=$(echo "$line" | cut -f1 -d',');
+                    obj_loss=$(echo "$line" | cut -f3 -d',');
+                    center_loss=$(echo "$line" | cut -f4 -d',' );
+                    scale_loss=$(echo "$line" | cut -f5 -d',');
+                    class_loss=$(echo "$line" | cut -f6 -d',');
+                    echo $epoch,$obj_loss,$center_loss,$scale_loss,$class_loss >> $train_loss_file
+                done < "$results_dir"/train.csv
+
+                {
+                read
+                num_line=0
+                while read line; do
+                    epoch=$(echo "$line" | cut -d';' -f 1 | cut -d'=' -f 2)
+                    if [ $epoch -gt -1 ]
+                    then
+                        num_classes=$(echo "$line" | cut -d';' -f 2 | cut -d'=' -f 2)
+                        counter=0
+                        IFS=';'
+                        read -a values <<< "$line"
+
+                        init=2
+                        while [ $counter -ne $num_classes ]
+                        do
+                            recall=$(echo ${values[$init]} | cut -d'=' -f 2)
+                            index=$((init + num_classes))
+                            precision=$(echo ${values[index]} | cut -d'=' -f 2)
+                            index=$((index + num_classes))
+                            f1=$(echo ${values[$index]} | cut -d'=' -f 2)
+                            index=$((index + num_classes))
+                            #score_threshold=$(echo ${values[$index]} | cut -d'=' -f 2)
+                            index=$((index + num_classes))
+                            ap=$(echo ${values[$index]} | cut -d'=' -f 2)
+                            class=$(echo ${values[$index]} | cut -d'=' -f 1)
+
+                            if (( $num_line == 0 )); then
+                                echo "epoch,recall,precision,f1,ap,map" > $summaries_dir/${class}_metrics.dat
+                            fi
+                            echo $epoch,$recall,$precision,$f1,$ap >> $summaries_dir/${class}_metrics.dat
+
+                            index=$((index + 1))
+                            map=$(echo ${values[$index]} | cut -d'=' -f 2)
+                            echo $epoch,$map >>  $summaries_dir/map.dat;
+
+                            ((counter++))
+                            ((init++))
+                        done
+                    fi
+
+                ((num_line++))
+                done
+                } < $results_dir/val.csv
+            ]]>
+        </task>
+        <task id="plot-loss" after="generate-plot-data" params="summaries_dir"
+              interpreter="gnuplot -e &quot;${task_code}&quot;">
+            <![CDATA[
+                outputdir = system("echo $summaries_dir");
+
+                set style line 1 linecolor rgb '#0060ad' linetype 1 linewidth 1 pointtype 7 pointsize 1;
+                set style line 2 linecolor rgb '#dd181f' linetype 1 linewidth 1 pointtype 7 pointsize 1;
+                set style line 3 linecolor rgb '#dfc018' linetype 1 linewidth 1 pointtype 7 pointsize 1;
+                set style line 4 linecolor rgb '#13b213' linetype 1 linewidth 1 pointtype 7 pointsize 1;
+
+                set xlabel "Epoch";
+                set ylabel "Losses";
+                set grid;
+                set key autotitle columnhead noenhanced;
+
+                set datafile separator ",";
+
+                set term png;
+                set key below;
+
+                train_loss_dat=sprintf("%s/train_loss.dat", outputdir);
+                lossplot=sprintf("%s/loss.png", outputdir);
+                set output lossplot;
+
+                plot train_loss_dat using 1:2 with lines ls 1, '' using 1:3 with lines ls 2, '' using 1:4 with lines ls 3, '' using 1:5 with lines ls 4;
+            ]]>
+        </task>
+        <task id="plot-map" after="generate-plot-data" params="summaries_dir"
+              interpreter="gnuplot -e &quot;${task_code}&quot;">
+            <![CDATA[
+                outputdir = system("echo $summaries_dir");
+
+                set style line 1 linecolor rgb '#0060ad' linetype 1 linewidth 1 pointtype 7 pointsize 1;
+
+                set xlabel "Epoch";
+                set ylabel "mAP";
+                set grid;
+
+                set datafile separator ",";
+
+                set term png;
+                set key below;
+
+                map_dat=sprintf("%s/map.dat", outputdir);
+
+                mapplot=sprintf("%s/map.png", outputdir);
+                set output mapplot;
+
+                plot map_dat title "mAP" with linespoints linestyle 1;
+            ]]>
+        </task>
+        <task id="plot-metrics" after="generate-plot-data" params="summaries_dir">
+            <![CDATA[
+                for file in $summaries_dir/*_metrics.dat; do
+                    class=$(echo $file | cut -d'/' -f 4 | cut -d'_' -f 1)
+                    gnuplot -e "filename='$file'; output='$summaries_dir/${class}_metrics.png'" scripts/plot_metrics.gp
+                done
+            ]]>
+        </task>
+        <task id="cleanup" after="plot-map plot-loss plot-metrics" params="summaries_dir">
+            <![CDATA[
+                rm $summaries_dir/*.dat
+            ]]>
+        </task>
+    </tasks>
+</pipeline>

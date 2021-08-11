@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<pipeline xmlns="http://www.sing-group.org/compi/pipeline-1.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <version>0.1.1</version>
+    <params>
+        <param name="development_percentage" shortName="dep" defaultValue="70">
+            Percentage of samples to be used for classifier development (remaining are for test).
+        </param>
+        <param name="training_percentage" shortName="trp" defaultValue="70">
+            Percentage of samples to be used for classifier training (remaining are for validation).
+        </param>
+        <param name="dataset_dir" shortName="dd" defaultValue="/datasets">
+            Path where the dataset is stored.
+        </param>
+        <param name="dataset_name" shortName="dn">
+            Name of the dataset that will be processed.
+        </param>
+        <param name="ttv_dir" shortName="td" defaultValue="/experiment/ttv">
+            Path where the splitted dataset will be stored.
+        </param>
+        <param name="seed" shortName="s" defaultValue="33">
+            Seed number for random number generation. Keep the same for reproducibility.
+        </param>
+    </params>
+    <tasks>
+        <task id="check-dataset" params="dataset_dir dataset_name">
+            <![CDATA[
+                if [ ! -d "${dataset_dir}/${dataset_name}" ]; then
+                    echo "Missing dataset ${dataset_name}. Please, use the download-dataset.sh script to download it.";
+                    exit 1;
+                fi;
+            ]]>
+        </task>
+        <task id="create-ttv" after="check-dataset"
+              params="dataset_dir dataset_name development_percentage training_percentage ttv_dir">
+            <![CDATA[
+                ./scripts/create_ttv.sh -dp $development_percentage -tp $training_percentage -d $dataset_dir/$dataset_name -ttv $ttv_dir
+            ]]>
+        </task>
+    </tasks>
+</pipeline>

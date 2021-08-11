@@ -1,0 +1,197 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<pipeline xmlns="http://www.sing-group.org/compi/pipeline-1.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <version>0.1.1</version>
+    <params>
+        <param name="dataset_dir" shortName="dd" defaultValue="/datasets">
+            Path where the dataset is stored.
+        </param>
+        <param name="dataset_name" shortName="dn">
+            Name of the dataset will be processed.
+        </param>
+        <param name="normal_mucosa_name" shortName="nmd">
+            Name of the dataset with videos that do contain any regions annotated as normal mucosa or not polyp.
+        </param>
+        <param name="ttv_dir" shortName="ttvd" defaultValue="/experiment/ttv">
+            Path where the splitted dataset is stored.
+        </param>
+        <param name="metadata_dir" shortName="md">
+            Path within the ttv_dir where the metadata to annotate videos is located.
+        </param>
+        <param name="results_dir" shortName="rd" defaultValue="/experiment/results">
+            Path where the results will be stored.
+        </param>
+        <param name="output_dir" shortName="od" defaultValue="">
+            Path within the results_dir where the annotated videos will be stored.
+        </param>
+        <param name="summaries_dir" shortName="sd" defaultValue="/experiment/summaries">
+            Path where the summaries will be stored.
+        </param>
+        <param name="downloads_cache" shortName="pdc" defaultValue="/downloads-cache">
+            Path where the videos for annotation will be stored.
+        </param>
+        <param name="URL_pattern" shortName="up">
+            URL pattern to download videos by identifier in the metadata file. The '%s' string will be replaced with the video id. e.g. http://myserver.com/video-id=%s
+        </param>
+        <param name="model_name" shortName="mn" defaultValue="yolo3_darknet53_voc">
+            Name of the CNN model. It must be a valid GluonCV model.
+        </param>
+        <param name="neuronal_network" shortName="nn">
+            Params file with the network parameters (CNN weights).
+        </param>
+        <param name="threshold_cnn" shortName="tc">
+            Neural network bounding box score threshold.
+        </param>
+        <param name="num_gpus" shortName="gpu" defaultValue="0">
+            Number of GPUs to use. 0 for CPU.
+        </param>
+        <param name="gpu_id" shortName="gi" defaultValue="0">
+            GPU identifier for sanity check.
+        </param>
+		<flag name="with_object_tracking" shortName="wot">
+			Variable to indicate whether to use object-tracking filtering or not.
+		</flag>
+    </params>
+    <tasks>
+        <task id="check-dataset" params="dataset_dir dataset_name normal_mucosa_name">
+            <![CDATA[
+                if [ ! -d "${dataset_dir}/${dataset_name}" ]; then
+                    echo "Missing dataset ${dataset_name}. Please, use the download-dataset.sh script to download it.";
+                    exit 1;
+                fi;
+                if [ ! -d "${dataset_dir}/${normal_mucosa_name}" ]; then
+                    echo "Missing dataset ${normal_mucosa_name}. Please, use the download-dataset.sh script to download it.";
+                    exit 1;
+                fi;
+            ]]>
+        </task>
+        <task id="check-neuronal-network" after="check-dataset" params="results_dir neuronal_network">
+            <![CDATA[
+                if [ ! -f "$results_dir/${neuronal_network}" ]; then
+                    echo "Missing neuronal network $results_dir/${neuronal_network}.";
+                    exit 1;
+                fi;
+            ]]>
+        </task>
+        <task id="check-gpu" after="check-neuronal-network" params="gpu_id">
+            scripts/sanity_check.sh $gpu_id
+        </task>
+        <task id="download-polyp-videos" after="check-gpu" params="ttv_dir metadata_dir downloads_cache URL_pattern dataset_dir dataset_name">
+            <![CDATA[
+                polyprecording_metadata=${dataset_dir}/${dataset_name}/polyprecording-metadata.csv
+
+                for polyp in $(cat $ttv_dir/$metadata_dir/metadata.csv | cut -d',' -f1 | uniq)
+                do
+                    grep $polyp $polyprecording_metadata | while read -r data; do
+                        video=$(echo $data | cut -d',' -f5)
+                        if [ ! -f "$downloads_cache/${video}.mp4" ]; then
+                            wget "${URL_pattern//%s/$video}" -O $downloads_cache/${video}.mp4
+                        fi
+                    done
+                done
+            ]]>
+        </task>
+        <task id="extract-polyp-segments" after="download-polyp-videos"
+              params="ttv_dir metadata_dir downloads_cache dataset_dir dataset_name results_dir output_dir">
+            <![CDATA[
+                polyprecording_metadata=${dataset_dir}/${dataset_name}/polyprecording-metadata.csv
+
+                [[ -d $results_dir/$output_dir/polyp_recordings ]] || mkdir -p $results_dir/$output_dir/polyp_recordings
+                
+                for polyp in $(cat $ttv_dir/$metadata_dir/metadata.csv | cut -d',' -f1 | uniq)
+                do
+                    echo "Generating polyp recordings with $polyp polyp"
+                    grep $polyp $polyprecording_metadata | while read -r data; do
+                        polyprecording_id=$(echo $data | cut -d ',' -f1)
+                        video=$(echo $data | cut -d ',' -f5)
+                        start=$(echo $data | cut -d ',' -f2)
+                        end=$(echo $data | cut -d ',' -f3)
+                        end=$(( end + 1 ))
+                        ffmpeg -i $downloads_cache/${video}.mp4 -ss $start -to $end -acodec copy -y $results_dir/$output_dir/polyp_recordings/${polyp}_${polyprecording_id}.mp4 2> /dev/null </dev/null
+                    done
+                done
+            ]]>
+        </task>
+        <task id="predict-polyp-segments" after="extract-polyp-segments predict-normal-mucosa-segments"
+              params="results_dir output_dir model_name neuronal_network threshold_cnn with_object_tracking">
+            <![CDATA[
+                cd cad
+                source activate polydeep_cad
+                export PYTHONPATH=.
+                [[ -d $results_dir/$output_dir/videos/polyp_recordings ]] || mkdir -p $results_dir/$output_dir/videos/polyp_recordings
+                for video_path in $(find $results_dir/$output_dir/polyp_recordings -name '*.mp4');
+                do
+                    echo "Procesing video $video_path"
+                    video=$(echo $video_path | rev | cut -d '/' -f1 | rev)
+                    video_name=$(echo $video | cut -d '.' -f1)
+					if [ ! -v $with_object_tracking ]; then
+						python3 application/PolyDeepCLI.py -in $results_dir/$output_dir/polyp_recordings/$video -out $results_dir/$output_dir/videos/polyp_recordings/$video -th $threshold_cnn -md $model_name -md-params $results_dir/$neuronal_network -md-pret -md-log $results_dir/$output_dir/videos/polyp_recordings/${video_name}.csv -tr MeanIoUThresholdTracking
+					else
+						python3 application/PolyDeepCLI.py -in $results_dir/$output_dir/polyp_recordings/$video -out $results_dir/$output_dir/videos/polyp_recordings/$video -th $threshold_cnn -md $model_name -md-params $results_dir/$neuronal_network -md-pret -md-print -md-log $results_dir/$output_dir/videos/polyp_recordings/${video_name}.csv
+					fi
+                done
+            ]]>
+        </task>
+        <task id="download-normal-mucosa-videos" after="check-gpu"
+              params="downloads_cache URL_pattern dataset_dir normal_mucosa_name">
+            <![CDATA[
+                {
+                    read
+                    while read line
+                    do
+                        video=$(echo $line | cut -d ',' -f4)
+                        if [ ! -f "$downloads_cache/${video}.mp4" ]; then
+                            wget "${URL_pattern//%s/$video}" -O $downloads_cache/${video}.mp4
+                        fi
+                    done 
+                } < $dataset_dir/$normal_mucosa_name/normal-mucosa-metadata.csv
+             ]]>
+        </task>
+        <task id="extract-normal-mucosa-segments" after="download-normal-mucosa-videos"
+              params="downloads_cache results_dir output_dir dataset_dir normal_mucosa_name">
+            <![CDATA[
+                [[ -d $results_dir/$output_dir/normal_mucosa ]] || mkdir -p $results_dir/$output_dir/normal_mucosa
+                {
+                    read
+                    while read line
+                    do
+                        video=$(echo $line | cut -d ',' -f4)
+                        echo "Generating videomodification with $video video"
+                        videomodification_id=$(echo $line | cut -d ',' -f1)
+                        start=$(echo $line | cut -d ',' -f2)
+                        end=$(echo $line | cut -d ',' -f3)
+                        end=$(( end + 1 ))
+                        ffmpeg -i $downloads_cache/${video}.mp4 -ss $start -to $end -acodec copy -y $results_dir/$output_dir/normal_mucosa/${video}_${videomodification_id}.mp4 2> /dev/null </dev/null
+                    done
+                } < $dataset_dir/$normal_mucosa_name/normal-mucosa-metadata.csv
+            ]]>
+        </task>
+        <task id="predict-normal-mucosa-segments" after="extract-normal-mucosa-segments" 
+			  params="results_dir output_dir model_name neuronal_network threshold_cnn with_object_tracking">
+            <![CDATA[
+                cd cad
+                source activate polydeep_cad
+                export PYTHONPATH=.
+                [[ -d $results_dir/$output_dir/videos/normal_mucosa ]] || mkdir -p $results_dir/$output_dir/videos/normal_mucosa
+                for video in $(find $results_dir/$output_dir/normal_mucosa -name '*.mp4');
+                do
+                    echo "Procesing video $video"
+                    video=$(echo $video | rev | cut -d '/' -f1 | rev)
+                    video_name=$(echo $video | cut -d '.' -f1)
+                    if [ ! -v $with_object_tracking ]; then
+						python3 application/PolyDeepCLI.py -in $results_dir/$output_dir/normal_mucosa/$video -out $results_dir/$output_dir/videos/normal_mucosa/$video -th $threshold_cnn -md $model_name -md-params $results_dir/$neuronal_network -md-pret -md-log $results_dir/$output_dir/videos/normal_mucosa/${video_name}.csv -tr MeanIoUThresholdTracking
+					else
+						python3 application/PolyDeepCLI.py -in $results_dir/$output_dir/normal_mucosa/$video -out $results_dir/$output_dir/videos/normal_mucosa/$video -th $threshold_cnn -md $model_name -md-params $results_dir/$neuronal_network -md-pret -md-print -md-log $results_dir/$output_dir/videos/normal_mucosa/${video_name}.csv
+					fi
+                done
+            ]]>
+        </task>
+        <task id="cleanup" after="predict-polyp-segments" params="results_dir output_dir">
+            <![CDATA[
+                #rm -r $results_dir/$output_dir/polyp_recordings
+                #rm -r $results_dir/$output_dir/normal_mucosa
+            ]]>
+        </task>
+    </tasks>
+</pipeline>
